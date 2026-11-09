@@ -1,0 +1,202 @@
+<!--
+  win10-stealth: Windows + RTX 4070 passthrough, hardened against VM checks.
+  Template: install.sh replaces /var/lib/libvirt/images/win11.qcow2. Reuses the AutoVirt VM's existing Windows install
+  (NVMe, 4K logical sectors: must stay that way or the partition table won't line up).
+
+  AutoVirt QEMU rewrites emulated PCI IDs to Intel Alder Lake (verified with `info pci`):
+    host bridge 8086:4641, pcie-root-port 8086:51b0, ISA 8086:5182, SATA 8086:463d,
+    SMBus 8086:51a3, NVMe 8086:0010  (stock QEMU: 1b36:000c / 1b36:0010 = Red Hat)
+
+  Which detection each block targets:
+    firmware        -> patched OVMF (/opt/AutoVirt/firmware) + host SMBIOS dump (-smbios file=)
+    pci vendor      -> only AutoVirt-patched Intel IDs, NEC xHCI, Intel e1000e, real 4070.
+                       No video/qxl, balloon, virtio, vIOMMU, or TPM (swtpm reports "IBM")
+    acpi signature  -> AutoVirt-patched QEMU (BXPC/QEMU0001 OEM strings removed),
+                       PCI hotplug + SMI hotplug ACPI methods off
+    system timer    -> HPET present (real boards expose it), no kvmclock, no hypervclock,
+                       no Hyper-V enlightenments, invariant TSC passed through
+    timing          -> partly: cpu-pm=on (HLT/MWAIT don't exit), pinned P-cores.
+                       CPUID/RDTSC exit latency needs the host KVM patch (see README).
+-->
+<domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>
+  <name>win10-stealth</name>
+  <uuid>2a30f605-8ddd-484d-a0e0-9c6431cc78e1</uuid>
+  <memory unit='GiB'>16</memory>
+  <currentMemory unit='GiB'>16</currentMemory>
+  <vcpu placement='static'>12</vcpu>
+
+  <!-- 14700KF: CPUs 0-15 = P-cores 0-7 (HT pairs), 16-27 = E-cores.
+       Guest gets P-cores 2-7; host keeps P-cores 0-1 + E-cores. -->
+  <cputune>
+    <vcpupin vcpu='0' cpuset='4'/>
+    <vcpupin vcpu='1' cpuset='5'/>
+    <vcpupin vcpu='2' cpuset='6'/>
+    <vcpupin vcpu='3' cpuset='7'/>
+    <vcpupin vcpu='4' cpuset='8'/>
+    <vcpupin vcpu='5' cpuset='9'/>
+    <vcpupin vcpu='6' cpuset='10'/>
+    <vcpupin vcpu='7' cpuset='11'/>
+    <vcpupin vcpu='8' cpuset='12'/>
+    <vcpupin vcpu='9' cpuset='13'/>
+    <vcpupin vcpu='10' cpuset='14'/>
+    <vcpupin vcpu='11' cpuset='15'/>
+    <emulatorpin cpuset='16-27'/>
+  </cputune>
+
+  <os>
+    <type arch='x86_64' machine='q35'>hvm</type>
+    <loader readonly='yes' secure='yes' type='pflash' format='raw'>/opt/AutoVirt/firmware/OVMF_CODE.fd</loader>
+    <nvram template='/opt/AutoVirt/firmware/OVMF_VARS.fd' templateFormat='raw' format='raw'>/var/lib/libvirt/qemu/nvram/win10-stealth_VARS.fd</nvram>
+    <bootmenu enable='no'/>
+  </os>
+
+  <features>
+    <acpi/>
+    <apic/>
+    <kvm>
+      <hidden state='on'/>
+    </kvm>
+    <vmport state='off'/>
+    <smm state='on'/>
+    <ioapic driver='qemu'/>
+    <msrs unknown='ignore'/>
+  </features>
+
+  <cpu mode='host-passthrough' check='none' migratable='off'>
+    <topology sockets='1' dies='1' clusters='1' cores='6' threads='2'/>
+    <cache mode='passthrough'/>
+    <maxphysaddr mode='passthrough'/>
+    <feature policy='disable' name='hypervisor'/>
+    <feature policy='require' name='invtsc'/>
+    <feature policy='require' name='vmx'/>
+  </cpu>
+
+  <clock offset='localtime'>
+    <timer name='rtc' tickpolicy='catchup'/>
+    <timer name='pit' tickpolicy='delay'/>
+    <timer name='hpet' present='yes'/>
+    <timer name='kvmclock' present='no'/>
+    <timer name='hypervclock' present='no'/>
+    <timer name='tsc' present='yes' mode='native'/>
+  </clock>
+
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <pm>
+    <suspend-to-mem enabled='yes'/>
+    <suspend-to-disk enabled='yes'/>
+  </pm>
+
+  <devices>
+    <emulator>/opt/AutoVirt/emulator/bin/qemu-system-x86_64</emulator>
+
+    <!-- same disk/serial/sector size Windows was installed with under AutoVirt -->
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' cache='none' io='native' discard='unmap'/>
+      <source file='/var/lib/libvirt/images/win11.qcow2'/>
+      <blockio logical_block_size='4096' physical_block_size='4096'/>
+      <target dev='sda' bus='nvme'/>
+      <serial>E10C13A4A391CBD4CF2B</serial>
+      <boot order='1'/>
+      <address type='drive' controller='0' bus='0' target='0' unit='0'/>
+    </disk>
+
+    <controller type='pci' index='0' model='pcie-root'/>
+    <controller type='pci' index='1' model='pcie-root-port'>
+      <model name='pcie-root-port'/>
+      <target chassis='1' port='0x10'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x1c' function='0x0' multifunction='on'/>
+    </controller>
+    <controller type='pci' index='2' model='pcie-root-port'>
+      <model name='pcie-root-port'/>
+      <target chassis='2' port='0x11'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x1c' function='0x1'/>
+    </controller>
+    <controller type='pci' index='3' model='pcie-root-port'>
+      <model name='pcie-root-port'/>
+      <target chassis='3' port='0x12'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x1c' function='0x2'/>
+    </controller>
+    <controller type='pci' index='4' model='pcie-root-port'>
+      <model name='pcie-root-port'/>
+      <target chassis='4' port='0x13'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x1c' function='0x3'/>
+    </controller>
+    <controller type='sata' index='0'>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x1f' function='0x2'/>
+    </controller>
+    <controller type='nvme' index='0'>
+      <serial>E10C13A4A391CBD4CF2B</serial>
+      <address type='pci' domain='0x0000' bus='0x04' slot='0x00' function='0x0'/>
+    </controller>
+    <controller type='usb' index='0' model='nec-xhci' ports='8'>
+      <address type='pci' domain='0x0000' bus='0x03' slot='0x00' function='0x0'/>
+    </controller>
+
+    <!-- RTX 4070: video + HDMI audio, same slot, like on real hardware -->
+    <hostdev mode='subsystem' type='pci' managed='yes'>
+      <source>
+        <address domain='0x0000' bus='0x01' slot='0x00' function='0x0'/>
+      </source>
+      <address type='pci' domain='0x0000' bus='0x01' slot='0x00' function='0x0' multifunction='on'/>
+    </hostdev>
+    <hostdev mode='subsystem' type='pci' managed='yes'>
+      <source>
+        <address domain='0x0000' bus='0x01' slot='0x00' function='0x1'/>
+      </source>
+      <address type='pci' domain='0x0000' bus='0x01' slot='0x00' function='0x1'/>
+    </hostdev>
+
+    <interface type='network'>
+      <mac address='68:05:ca:a4:f8:49'/>
+      <source network='default'/>
+      <model type='e1000e'/>
+      <address type='pci' domain='0x0000' bus='0x02' slot='0x00' function='0x0'/>
+    </interface>
+
+    <!-- Keyboard/mouse: evdev feeds the emulated PS/2 i8042 (looks like a generic
+         PS/2 kbd/mouse, unlike QEMU's USB HID). Scroll Lock toggles host/guest. -->
+    <input type='mouse' bus='ps2'/>
+    <input type='keyboard' bus='ps2'/>
+    <input type='evdev'>
+      <source dev='/dev/input/by-id/usb-_X68HE-event-kbd' grab='all' grabToggle='scrolllock' repeat='on'/>
+    </input>
+    <input type='evdev'>
+      <source dev='/dev/input/by-id/usb-Logitech_G502_HERO_Gaming_Mouse_206E39B74145-event-mouse' grabToggle='scrolllock'/>
+    </input>
+
+    <video>
+      <model type='none'/>
+    </video>
+    <audio id='1' type='none'/>
+    <memballoon model='none'/>
+
+    <tpm model='tpm-crb'>
+      <backend type='emulator' version='2.0'/>
+    </tpm>
+
+    <iommu model='intel'>
+      <driver intremap='on' caching_mode='on' eim='on' iotlb='on'/>
+    </iommu>
+  </devices>
+
+  <qemu:commandline>
+    <!-- full host SMBIOS dump (B660 DS3H, AMI F32, DIMMs, slots) -->
+    <qemu:arg value='-smbios'/>
+    <qemu:arg value='file=/opt/AutoVirt/firmware/smbios.bin'/>
+    <!-- HLT/MWAIT/PAUSE handled in guest: fewer VM exits, saner idle timing -->
+    <qemu:arg value='-overcommit'/>
+    <qemu:arg value='cpu-pm=on'/>
+    <qemu:arg value='-global'/>
+    <qemu:arg value='host-x86_64-cpu.kvm-pv-enforce-cpuid=on'/>
+    <qemu:arg value='-global'/>
+    <qemu:arg value='host-x86_64-cpu.model-id=12th Gen Intel(R) Core(TM) i5-12400F'/>
+    <qemu:arg value='-global'/>
+    <qemu:arg value='ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off'/>
+    <qemu:arg value='-global'/>
+    <qemu:arg value='ICH9-LPC.x-smi-cpu-hotplug=off'/>
+    <qemu:arg value='-global'/>
+    <qemu:arg value='ICH9-LPC.x-smi-cpu-hotunplug=off'/>
+  </qemu:commandline>
+</domain>

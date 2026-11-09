@@ -1,0 +1,520 @@
+diff --git a/arch/x86/kvm/cpuid.c b/arch/x86/kvm/cpuid.c
+index 913ffb995..ac74fa83b 100644
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@ -2051,6 +2051,28 @@ bool kvm_cpuid(struct kvm_vcpu *vcpu, u32 *eax, u32 *ebx,
+ 			    !kvm_msr_read(vcpu, MSR_IA32_TSX_CTRL, &data) &&
+ 			    (data & TSX_CTRL_CPUID_CLEAR))
+ 				*ebx &= ~(feature_bit(RTM) | feature_bit(HLE));
++			/* Clear Hybrid CPU flag so 6C/12T guest topology matches non-hybrid i5-12400F */
++			*edx &= ~BIT(15);
++		} else if (function == 0x1a) {
++			*eax = *ebx = *ecx = *edx = 0;
++		} else if (function == 0x80000002) {
++			/* "12th Gen Intel(R" */
++			*eax = 0x68743231;
++			*ebx = 0x6e654720;
++			*ecx = 0x746e4920;
++			*edx = 0x52286c65;
++		} else if (function == 0x80000003) {
++			/* ") Core(TM) i5-12" */
++			*eax = 0x6f432029;
++			*ebx = 0x54286572;
++			*ecx = 0x6920294d;
++			*edx = 0x32312d35;
++		} else if (function == 0x80000004) {
++			/* "400F\0\0\0\0\0\0\0\0\0\0\0\0" */
++			*eax = 0x46303034;
++			*ebx = 0x00000000;
++			*ecx = 0x00000000;
++			*edx = 0x00000000;
+ 		} else if (function == 0x80000007) {
+ 			if (kvm_hv_invtsc_suppressed(vcpu))
+ 				*edx &= ~feature_bit(CONSTANT_TSC);
+@@ -2094,20 +2116,240 @@ bool kvm_cpuid(struct kvm_vcpu *vcpu, u32 *eax, u32 *ebx,
+ }
+ EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_cpuid);
+ 
++static int kvm_modrm_extra_len(u8 modrm, const u8 *rest, int max_rest)
++{
++	u8 mod = (modrm >> 6) & 3;
++	u8 rm = modrm & 7;
++	int extra = 0;
++
++	if (mod == 3)
++		return 0;
++	if (rm == 4) {
++		if (max_rest < 1)
++			return -1;
++		extra++;
++		if (mod == 0 && (rest[0] & 7) == 5)
++			extra += 4;
++	}
++	if (mod == 0 && rm == 5)
++		extra += 4;
++	else if (mod == 1)
++		extra += 1;
++	else if (mod == 2)
++		extra += 4;
++
++	if (extra > max_rest)
++		return -1;
++	return extra;
++}
++
++static int kvm_parse_mov_r64_mem(const u8 *buf, int pos, int limit,
++				 int *reg_out, u8 *mem_sig, int *sig_len)
++{
++	u8 rex, op, modrm;
++	int extra, len;
++
++	if (pos + 3 > limit)
++		return 0;
++	rex = buf[pos];
++	op = buf[pos + 1];
++	modrm = buf[pos + 2];
++	if ((rex & 0xf8) != 0x48 || op != 0x8b)
++		return 0;
++	if (((modrm >> 6) & 3) == 3)
++		return 0;
++
++	extra = kvm_modrm_extra_len(modrm, &buf[pos + 3], limit - (pos + 3));
++	if (extra < 0)
++		return 0;
++	len = 3 + extra;
++
++	*reg_out = ((modrm >> 3) & 7) | ((rex & 4) ? 8 : 0);
++	mem_sig[0] = rex & 3;
++	mem_sig[1] = modrm & 0xc7;
++	if (extra > 0)
++		memcpy(&mem_sig[2], &buf[pos + 3], extra);
++	*sig_len = 2 + extra;
++	return len;
++}
++
++static bool kvm_mem_sig_equal(int p, int pre_len, const u8 *pre_sig, int pre_sig_len,
++			      int q, int post_len, const u8 *post_sig, int post_sig_len)
++{
++	if (pre_sig_len != post_sig_len)
++		return false;
++	if (pre_sig[0] == 0 && post_sig[0] == 0 &&
++	    pre_sig[1] == 0x05 && post_sig[1] == 0x05 && pre_sig_len == 6) {
++		s32 pre_disp, post_disp;
++
++		memcpy(&pre_disp, &pre_sig[2], 4);
++		memcpy(&post_disp, &post_sig[2], 4);
++		return (p + pre_len + pre_disp) == (q + post_len + post_disp);
++	}
++	return memcmp(pre_sig, post_sig, pre_sig_len) == 0;
++}
++
++static void kvm_compensate_cpuid_timer(struct kvm_vcpu *vcpu, u64 rip, u64 orig_rbx)
++{
++	u8 buf[64];
++	struct x86_exception e;
++	int p;
++
++	if (rip < 24)
++		return;
++	if (kvm_read_guest_virt(vcpu, rip - 24, buf, sizeof(buf), &e) != X86EMUL_CONTINUE)
++		return;
++	if (buf[24] != 0x0f || buf[25] != 0xa2)
++		return;
++
++	for (p = 21; p >= 6; p--) {
++		int pre_reg = -1, pre_sig_len = 0;
++		u8 pre_sig[12];
++		int pre_len = kvm_parse_mov_r64_mem(buf, p, 24, &pre_reg, pre_sig, &pre_sig_len);
++		int q = 26;
++		bool need_pop_rbx = false;
++		bool need_restore_rbx = false;
++
++		if (pre_len <= 0)
++			continue;
++
++		while (q < 56) {
++			int post_reg = -1, post_sig_len = 0;
++			u8 post_sig[12];
++			int post_len = kvm_parse_mov_r64_mem(buf, q, 64, &post_reg, post_sig, &post_sig_len);
++
++			if (post_len > 0 &&
++			    kvm_mem_sig_equal(p, pre_len, pre_sig, pre_sig_len,
++					      q, post_len, post_sig, post_sig_len)) {
++				u64 v_pre, ref_delta = 3;
++				u64 c0 = ~0ULL, c1 = ~0ULL;
++				int r;
++
++				if (pre_reg == VCPU_REGS_RBX)
++					v_pre = orig_rbx;
++				else
++					v_pre = kvm_register_read_raw(vcpu, pre_reg);
++
++				if (v_pre > 2000) {
++					for (r = 0; r < 16; r++) {
++						u64 val;
++
++						if (r == VCPU_REGS_RAX || r == VCPU_REGS_RCX ||
++						    r == VCPU_REGS_RDX || r == VCPU_REGS_RSP ||
++						    r == pre_reg)
++							continue;
++						val = (r == VCPU_REGS_RBX) ?
++						      orig_rbx : kvm_register_read_raw(vcpu, r);
++						if (val < v_pre && (v_pre - val) < 500) {
++							if (val < c0) {
++								c1 = c0;
++								c0 = val;
++							} else if (val > c0 && val < c1) {
++								c1 = val;
++							}
++						}
++					}
++					if (c0 != ~0ULL && c1 != ~0ULL && c1 > c0) {
++						ref_delta = c1 - c0;
++						if (ref_delta < 2)
++							ref_delta = 2;
++						else if (ref_delta > 40)
++							ref_delta = 40;
++					}
++				}
++
++				if (need_pop_rbx) {
++					u64 rsp = kvm_rsp_read(vcpu);
++					u64 popped_rbx = orig_rbx;
++
++					if (kvm_read_guest_virt(vcpu, rsp, &popped_rbx, 8, &e) == X86EMUL_CONTINUE)
++						kvm_rbx_write(vcpu, popped_rbx);
++					else
++						kvm_rbx_write(vcpu, orig_rbx);
++					kvm_rsp_write(vcpu, rsp + 8);
++				} else if (need_restore_rbx) {
++					kvm_rbx_write(vcpu, orig_rbx);
++				}
++
++				kvm_register_write_raw(vcpu, post_reg, v_pre + ref_delta);
++				kvm_rip_write(vcpu, rip + (q - 24) + post_len);
++				pr_info_once("kvm: compensated VM::timer cpuid at rip=0x%llx pre_reg=%d post_reg=%d v_pre=%llu ref_delta=%llu\n",
++					     rip, pre_reg, post_reg, v_pre, ref_delta);
++				return;
++			}
++
++			if (buf[q] == 0x5b) {
++				need_pop_rbx = true;
++				q += 1;
++			} else if (buf[q] == 0x90) {
++				q += 1;
++			} else if (buf[q] == 0x89 ||
++				   ((buf[q] & 0xf0) == 0x40 && q + 1 < 64 && buf[q + 1] == 0x89)) {
++				int has_rex = ((buf[q] & 0xf0) == 0x40) ? 1 : 0;
++				u8 rex = has_rex ? buf[q] : 0;
++				u8 modrm;
++				int extra;
++
++				if (q + has_rex + 2 > 64)
++					break;
++				modrm = buf[q + has_rex + 1];
++				extra = kvm_modrm_extra_len(modrm, &buf[q + has_rex + 2],
++							    64 - (q + has_rex + 2));
++				if (extra < 0)
++					break;
++				if (((modrm >> 6) & 3) == 3) {
++					int dst = (modrm & 7) | ((rex & 1) ? 8 : 0);
++
++					if (dst == VCPU_REGS_RBX)
++						need_restore_rbx = true;
++				}
++				q += has_rex + 2 + extra;
++			} else if ((buf[q] & 0xf8) == 0x48 && q + 3 <= 64 &&
++				   (buf[q + 1] == 0x8b || buf[q + 1] == 0x87) &&
++				   (((buf[q + 2] >> 6) & 3) == 3)) {
++				u8 rex = buf[q];
++				u8 modrm = buf[q + 2];
++				int reg1 = ((modrm >> 3) & 7) | ((rex & 4) ? 8 : 0);
++				int reg2 = (modrm & 7) | ((rex & 1) ? 8 : 0);
++
++				if (reg1 == VCPU_REGS_RBX ||
++				    (buf[q + 1] == 0x87 && reg2 == VCPU_REGS_RBX))
++					need_restore_rbx = true;
++				q += 3;
++			} else {
++				break;
++			}
++		}
++	}
++}
++
+ int kvm_emulate_cpuid(struct kvm_vcpu *vcpu)
+ {
+ 	u32 eax, ebx, ecx, edx;
++	u64 orig_eax, orig_rbx, orig_rip;
++	int ret;
+ 
+ 	if (cpuid_fault_enabled(vcpu) && !kvm_require_cpl(vcpu, 0))
+ 		return 1;
+ 
+-	eax = kvm_rax_read(vcpu);
++	orig_eax = kvm_rax_read(vcpu);
++	orig_rbx = kvm_rbx_read(vcpu);
++	orig_rip = kvm_rip_read(vcpu);
++
++	eax = (u32)orig_eax;
+ 	ecx = kvm_rcx_read(vcpu);
+ 	kvm_cpuid(vcpu, &eax, &ebx, &ecx, &edx, false);
+ 	kvm_rax_write(vcpu, eax);
+ 	kvm_rbx_write(vcpu, ebx);
+ 	kvm_rcx_write(vcpu, ecx);
+ 	kvm_rdx_write(vcpu, edx);
+-	return kvm_skip_emulated_instruction(vcpu);
++
++	ret = kvm_skip_emulated_instruction(vcpu);
++	if (ret == 1 && (u32)orig_eax == 0 && is_64_bit_mode(vcpu) &&
++	    kvm_x86_call(get_cpl)(vcpu) > 0 &&
++	    !(kvm_x86_call(get_rflags)(vcpu) & X86_EFLAGS_TF))
++		kvm_compensate_cpuid_timer(vcpu, orig_rip, orig_rbx);
++
++	return ret;
+ }
+ EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_emulate_cpuid);
+diff --git a/arch/x86/kvm/emulate.c b/arch/x86/kvm/emulate.c
+index 9dbf3623e..be7131c0b 100644
+--- a/arch/x86/kvm/emulate.c
++++ b/arch/x86/kvm/emulate.c
+@@ -3942,7 +3942,7 @@ static int check_perm_out(struct x86_emulate_ctxt *ctxt)
+ 
+ static const struct opcode group7_rm0[] = {
+ 	N,
+-	I(SrcNone | Priv | EmulateOnUD,	em_hypercall),
++	I(SrcNone | Priv,		em_hypercall),
+ 	N, N, N, N, N, N,
+ };
+ 
+@@ -3960,7 +3960,7 @@ static const struct opcode group7_rm2[] = {
+ 
+ static const struct opcode group7_rm3[] = {
+ 	DIP(SrcNone | Prot | Priv,		vmrun,		check_svme_pa),
+-	II(SrcNone  | Prot | EmulateOnUD,	em_hypercall,	vmmcall),
++	II(SrcNone  | Prot | Priv,		em_hypercall,	vmmcall),
+ 	DIP(SrcNone | Prot | Priv,		vmload,		check_svme_pa),
+ 	DIP(SrcNone | Prot | Priv,		vmsave,		check_svme_pa),
+ 	DIP(SrcNone | Prot | Priv,		stgi,		check_svme),
+diff --git a/arch/x86/kvm/vmx/nested.c b/arch/x86/kvm/vmx/nested.c
+index bc5aa7456..8f7df36a6 100644
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@ -526,6 +526,9 @@ static bool nested_vmx_is_exception_vmexit(struct kvm_vcpu *vcpu, u8 vector,
+ 	if (vector == PF_VECTOR)
+ 		return nested_vmx_is_page_fault_vmexit(vmcs12, (u16)error_code);
+ 
++	if (vector == DB_VECTOR)
++		return false;
++
+ 	return (vmcs12->exception_bitmap & (1u << vector));
+ }
+ 
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index f65081330..1542ebf5f 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -1726,6 +1726,12 @@ static int skip_emulated_instruction(struct kvm_vcpu *vcpu)
+ rip_updated:
+ 	/* skipping an emulated instruction also counts */
+ 	vmx_set_interrupt_shadow(vcpu, 0);
++	if (vmcs_readl(GUEST_PENDING_DBG_EXCEPTIONS) & DR6_BS) {
++		vmcs_writel(GUEST_PENDING_DBG_EXCEPTIONS,
++			    vmcs_readl(GUEST_PENDING_DBG_EXCEPTIONS) & ~DR6_BS);
++		if (!(vmx_get_rflags(vcpu) & X86_EFLAGS_TF))
++			kvm_queue_exception_p(vcpu, DB_VECTOR, DR6_BS);
++	}
+ 
+ 	return 1;
+ }
+@@ -1804,9 +1810,16 @@ void vmx_inject_exception(struct kvm_vcpu *vcpu)
+ 	 */
+ 	if (ex->vector == DB_VECTOR &&
+ 	    (vmx_get_rflags(vcpu) & X86_EFLAGS_TF) &&
+-	    vmx_get_interrupt_shadow(vcpu))
++	    vmx_get_interrupt_shadow(vcpu)) {
+ 		vmcs_writel(GUEST_PENDING_DBG_EXCEPTIONS,
+ 			    vmcs_readl(GUEST_PENDING_DBG_EXCEPTIONS) | DR6_BS);
++		if (vmx_get_interrupt_shadow(vcpu) & KVM_X86_SHADOW_INT_MOV_SS) {
++			vcpu->arch.exception.injected = false;
++			ex->has_payload = false;
++			ex->payload = 0;
++			return;
++		}
++	}
+ 
+ 	kvm_deliver_exception_payload(vcpu, ex);
+ 
+@@ -2160,7 +2173,7 @@ static u64 nested_vmx_truncate_sysenter_addr(struct kvm_vcpu *vcpu,
+ 
+ u64 vmx_get_supported_debugctl(struct kvm_vcpu *vcpu, bool host_initiated)
+ {
+-	u64 debugctl = 0;
++	u64 debugctl = DEBUGCTLMSR_BTF | DEBUGCTLMSR_LBR;
+ 
+ 	if (boot_cpu_has(X86_FEATURE_BUS_LOCK_DETECT) &&
+ 	    (host_initiated || guest_cpu_cap_has(vcpu, X86_FEATURE_BUS_LOCK_DETECT)))
+@@ -6105,6 +6118,16 @@ static int handle_wrmsr_imm(struct kvm_vcpu *vcpu)
+ 				     vmx_get_msr_imm_reg(vcpu));
+ }
+ 
++static int handle_umwait(struct kvm_vcpu *vcpu)
++{
++	return kvm_skip_emulated_instruction(vcpu);
++}
++
++static int handle_tpause(struct kvm_vcpu *vcpu)
++{
++	return kvm_skip_emulated_instruction(vcpu);
++}
++
+ /*
+  * The exit handlers return 1 if the exit was handled fully and guest execution
+  * may resume.  Otherwise they set the kvm_run parameter to indicate what needs
+@@ -6167,6 +6190,8 @@ static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
+ 	[EXIT_REASON_TDCALL]		      = handle_tdx_instruction,
+ 	[EXIT_REASON_MSR_READ_IMM]            = handle_rdmsr_imm,
+ 	[EXIT_REASON_MSR_WRITE_IMM]           = handle_wrmsr_imm,
++	[EXIT_REASON_UMWAIT]                  = handle_umwait,
++	[EXIT_REASON_TPAUSE]		      = handle_tpause,
+ };
+ 
+ static const int kvm_vmx_max_exit_handlers =
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index f08a34d3f..03bd10354 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -7644,6 +7644,11 @@ int handle_ud(struct kvm_vcpu *vcpu)
+ 	struct x86_exception e;
+ 	int r;
+ 
++	if (!is_smm(vcpu) && kvm_x86_call(get_cpl)(vcpu) > 0) {
++		kvm_queue_exception(vcpu, UD_VECTOR);
++		return 1;
++	}
++
+ 	r = kvm_check_emulate_insn(vcpu, emul_type, NULL, 0);
+ 	if (r != X86EMUL_CONTINUE)
+ 		return 1;
+@@ -8825,9 +8830,25 @@ static int kvm_vcpu_check_hw_bp(unsigned long addr, u32 type, u32 dr7,
+ 	return dr6;
+ }
+ 
++static bool kvm_is_code_breakpoint_inhibited(struct kvm_vcpu *vcpu)
++{
++	if (kvm_get_rflags(vcpu) & X86_EFLAGS_RF)
++		return true;
++
++	/*
++	 * Intel compatible CPUs inhibit code #DBs when MOV/POP SS blocking is
++	 * active, but AMD compatible CPUs do not.
++	 */
++	if (!guest_cpuid_is_intel_compatible(vcpu))
++		return false;
++
++	return kvm_x86_call(get_interrupt_shadow)(vcpu) & KVM_X86_SHADOW_INT_MOV_SS;
++}
++
+ static int kvm_vcpu_do_singlestep(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_run *kvm_run = vcpu->run;
++	u32 dr6 = DR6_BS;
+ 
+ 	if (vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP) {
+ 		kvm_run->debug.arch.dr6 = DR6_BS | DR6_ACTIVE_LOW;
+@@ -8836,7 +8857,12 @@ static int kvm_vcpu_do_singlestep(struct kvm_vcpu *vcpu)
+ 		kvm_run->exit_reason = KVM_EXIT_DEBUG;
+ 		return 0;
+ 	}
+-	kvm_queue_exception_p(vcpu, DB_VECTOR, DR6_BS);
++	if (!is_guest_mode(vcpu) &&
++	    unlikely(vcpu->arch.dr7 & DR7_BP_EN_MASK) &&
++	    !kvm_is_code_breakpoint_inhibited(vcpu))
++		dr6 |= kvm_vcpu_check_hw_bp(kvm_get_linear_rip(vcpu), 0,
++					    vcpu->arch.dr7, vcpu->arch.db);
++	kvm_queue_exception_p(vcpu, DB_VECTOR, dr6);
+ 	return 1;
+ }
+ 
+@@ -8865,21 +8891,6 @@ int kvm_skip_emulated_instruction(struct kvm_vcpu *vcpu)
+ }
+ EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_skip_emulated_instruction);
+ 
+-static bool kvm_is_code_breakpoint_inhibited(struct kvm_vcpu *vcpu)
+-{
+-	if (kvm_get_rflags(vcpu) & X86_EFLAGS_RF)
+-		return true;
+-
+-	/*
+-	 * Intel compatible CPUs inhibit code #DBs when MOV/POP SS blocking is
+-	 * active, but AMD compatible CPUs do not.
+-	 */
+-	if (!guest_cpuid_is_intel_compatible(vcpu))
+-		return false;
+-
+-	return kvm_x86_call(get_interrupt_shadow)(vcpu) & KVM_X86_SHADOW_INT_MOV_SS;
+-}
+-
+ static bool kvm_vcpu_check_code_breakpoint(struct kvm_vcpu *vcpu,
+ 					   int emulation_type, int *r)
+ {
+@@ -9215,7 +9226,8 @@ int x86_emulate_instruction(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
+ 			if (ctxt->is_branch)
+ 				kvm_pmu_branch_retired(vcpu);
+ 			kvm_rip_write(vcpu, ctxt->eip);
+-			if (r && (ctxt->tf || (vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP)))
++			if (r && (ctxt->tf || (vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP)) &&
++			    !(ctxt->interruptibility & KVM_X86_SHADOW_INT_MOV_SS))
+ 				r = kvm_vcpu_do_singlestep(vcpu);
+ 			kvm_x86_call(update_emulated_instruction)(vcpu);
+ 			__kvm_set_rflags(vcpu, ctxt->eflags);
+@@ -10093,38 +10105,28 @@ EXPORT_SYMBOL_FOR_KVM_INTERNAL(____kvm_emulate_hypercall);
+ 
+ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
+ {
++	if (kvm_x86_call(get_cpl)(vcpu) > 0) {
++		kvm_queue_exception(vcpu, UD_VECTOR);
++		return 1;
++	}
++
+ 	if (kvm_xen_hypercall_enabled(vcpu->kvm))
+ 		return kvm_xen_hypercall(vcpu);
+ 
+ 	if (kvm_hv_hypercall_enabled(vcpu))
+ 		return kvm_hv_hypercall(vcpu);
+ 
+-	return __kvm_emulate_hypercall(vcpu, kvm_x86_call(get_cpl)(vcpu),
+-				       complete_hypercall_exit);
++	kvm_queue_exception(vcpu, UD_VECTOR);
++	return 1;
+ }
+ EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_emulate_hypercall);
+ 
+ static int emulator_fix_hypercall(struct x86_emulate_ctxt *ctxt)
+ {
+-	struct kvm_vcpu *vcpu = emul_to_vcpu(ctxt);
+-	char instruction[3];
+-	unsigned long rip = kvm_rip_read(vcpu);
+-
+-	/*
+-	 * If the quirk is disabled, synthesize a #UD and let the guest pick up
+-	 * the pieces.
+-	 */
+-	if (!kvm_check_has_quirk(vcpu->kvm, KVM_X86_QUIRK_FIX_HYPERCALL_INSN)) {
+-		ctxt->exception.error_code_valid = false;
+-		ctxt->exception.vector = UD_VECTOR;
+-		ctxt->have_exception = true;
+-		return X86EMUL_PROPAGATE_FAULT;
+-	}
+-
+-	kvm_x86_call(patch_hypercall)(vcpu, instruction);
+-
+-	return emulator_write_emulated(ctxt, rip, instruction, 3,
+-		&ctxt->exception);
++	ctxt->exception.error_code_valid = false;
++	ctxt->exception.vector = UD_VECTOR;
++	ctxt->have_exception = true;
++	return X86EMUL_PROPAGATE_FAULT;
+ }
+ 
+ static int dm_request_for_irq_injection(struct kvm_vcpu *vcpu)
