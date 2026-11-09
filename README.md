@@ -92,3 +92,4 @@ virsh -c qemu:///system start win10-stealth
 * [Host GPU Passthrough & VFIO Setup](docs/GPU_PASSTHROUGH_SETUP.md)
 
 <img src=https://raw.githubusercontent.com/aaesth/almostAutoVirt/refs/heads/main/img-2026-11-09-22-02-29.png>
+any good anticheat will detect this, maybe not eac thoNotRequiem
