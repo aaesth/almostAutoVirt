@@ -1,4 +1,4 @@
-<img width="2560" height="1440" alt="image" src="https://github.com/user-attachments/assets/406a7141-6994-46d3-879c-79d8946b5db7" /># almostAutoVirt
+# almostAutoVirt
 > [!NOTE]  
 > This AI slop project is public incase anyone wants to copy anything from here
 
